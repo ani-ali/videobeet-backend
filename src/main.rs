@@ -71,11 +71,12 @@ async fn main() {
         }
     };
 
-    // Configure CORS
+    // Configure CORS - Allow all origins and headers for full access
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::CONTENT_TYPE, header::ACCEPT])
+        .allow_methods(Any)
+        .allow_headers(Any)
+        .expose_headers(Any)
         .max_age(std::time::Duration::from_secs(86400));
 
     // Create app with route
