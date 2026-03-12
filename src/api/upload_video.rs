@@ -10,6 +10,7 @@ use rusqlite::params;
 use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use rusqlite::Connection;
+use tokio::task;
 
 type DbConnection = Arc<Mutex<Connection>>;
 
@@ -173,15 +174,52 @@ pub async fn handle_upload(
         );
     }
 
-    println!("processing video: {}", file_name);
+    // Save video to database with "processing" status
+    let upload_date = Utc::now().to_rfc3339();
+    if let Ok(conn) = db.lock() {
+        let result = conn.execute(
+            "INSERT INTO videos (id, title, original_filename, file_extension, duration, resolution, upload_date, description, view_count, thumbnail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                id.to_string(),
+                final_title.clone(),
+                file_name.clone(),
+                file_extension.clone(),
+                None::<f64>, // duration - will update after processing
+                None::<String>, // resolution - will update after processing
+                upload_date,
+                final_description.clone(),
+                0,
+                None::<String> // thumbnail - will update after processing
+            ],
+        );
 
-    // use ffmpeg to create hls chunks
-    let hls_dir = format!("videos/output/{}", id);
-    let playlist_path = format!("{}/playlist.m3u8", hls_dir);
+        if let Err(e) = result {
+            println!("failed to save initial record: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to save: {}", e),
+            );
+        }
+    }
 
-    let output = Command::new("ffmpeg")
+    // Clone values for async processing
+    let id_clone = id;
+    let temp_path_clone = temp_path.clone();
+    let file_name_clone = file_name.clone();
+    let db_clone = db.clone();
+
+    // Spawn background task for video processing
+    task::spawn_blocking(move || {
+        println!("background processing started for: {}", file_name_clone);
+
+        // use ffmpeg to create hls chunks
+        let hls_dir = format!("videos/output/{}", id_clone);
+        let playlist_path = format!("{}/playlist.m3u8", hls_dir);
+
+        let output = Command::new("ffmpeg")
         .args(&[
-            "-i", &temp_path,
+            "-i", &temp_path_clone,
             "-c:v", "libx264",
             "-c:a", "aac",
             "-preset", "fast",
@@ -206,7 +244,7 @@ pub async fn handle_upload(
                         "-print_format", "json",
                         "-show_format",
                         "-show_streams",
-                        &temp_path,
+                        &temp_path_clone,
                     ])
                     .output();
 
@@ -251,7 +289,7 @@ pub async fn handle_upload(
                     let thumbnail_output = Command::new("ffmpeg")
                         .args(&[
                             "-ss", &format!("{}", random_second),
-                            "-i", &temp_path,
+                            "-i", &temp_path_clone,
                             "-vframes", "1",
                             "-vf", "scale=1280:-1",
                             "-q:v", "2",
@@ -277,56 +315,67 @@ pub async fn handle_upload(
                 // save to database
                 let upload_date = Utc::now().to_rfc3339();
                 let thumbnail_filename = if thumbnail_generated {
-                    Some(format!("{}/thumbnail.jpg", id))
+                    Some(format!("{}/thumbnail.jpg", id_clone))
                 } else {
                     None
                 };
 
-                if let Ok(conn) = db.lock() {
+                // Update database with processing results
+                if let Ok(conn) = db_clone.lock() {
                     let result = conn.execute(
-                        "INSERT INTO videos (id, title, original_filename, file_extension, duration, resolution, upload_date, description, view_count, thumbnail)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        "UPDATE videos SET duration = ?1, resolution = ?2, thumbnail = ?3 WHERE id = ?4",
                         params![
-                            id.to_string(),
-                            final_title,
-                            file_name.clone(),
-                            file_extension,
                             duration,
                             resolution,
-                            upload_date,
-                            final_description,
-                            0,
-                            thumbnail_filename
+                            thumbnail_filename,
+                            id_clone.to_string()
                         ],
                     );
 
                     if let Err(e) = result {
-                        println!("failed to save to db: {}", e);
+                        println!("failed to update video in db: {}", e);
+                    } else {
+                        println!("video {} processing complete and saved", id_clone);
                     }
                 }
 
-                return (
-                    StatusCode::OK,
-                    format!("video processed! id: {}", id),
-                );
+                println!("background processing complete for video: {}", id_clone);
             } else {
                 let error = String::from_utf8_lossy(&result.stderr);
-                println!("ffmpeg error: {}", error);
-                std::fs::remove_dir_all(format!("videos/input/{}", id)).ok();
-                std::fs::remove_dir_all(format!("videos/output/{}", id)).ok();
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to process: {}", error),
-                );
+                println!("ffmpeg error for video {}: {}", id_clone, error);
+                // Clean up on error
+                std::fs::remove_dir_all(format!("videos/input/{}", id_clone)).ok();
+                std::fs::remove_dir_all(format!("videos/output/{}", id_clone)).ok();
+
+                // Remove failed video from database
+                if let Ok(conn) = db_clone.lock() {
+                    conn.execute(
+                        "DELETE FROM videos WHERE id = ?1",
+                        params![id_clone.to_string()],
+                    ).ok();
+                }
             }
         }
         Err(e) => {
-            std::fs::remove_dir_all(format!("videos/input/{}", id)).ok();
-            std::fs::remove_dir_all(format!("videos/output/{}", id)).ok();
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("ffmpeg not found: {}", e),
-            );
+            println!("ffmpeg command failed for video {}: {}", id_clone, e);
+            // Clean up on error
+            std::fs::remove_dir_all(format!("videos/input/{}", id_clone)).ok();
+            std::fs::remove_dir_all(format!("videos/output/{}", id_clone)).ok();
+
+            // Remove failed video from database
+            if let Ok(conn) = db_clone.lock() {
+                conn.execute(
+                    "DELETE FROM videos WHERE id = ?1",
+                    params![id_clone.to_string()],
+                ).ok();
+            }
         }
     }
+    });
+
+    // Return immediate success - processing happens in background
+    return (
+        StatusCode::OK,
+        format!("Upload successful! Video processing started. id: {}", id),
+    );
 }
