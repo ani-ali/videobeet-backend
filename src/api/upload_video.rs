@@ -184,7 +184,7 @@ pub async fn handle_upload(
                 id.to_string(),
                 final_title.clone(),
                 file_name.clone(),
-                file_extension.clone(),
+                file_extension,
                 None::<f64>, // duration - will update after processing
                 None::<String>, // resolution - will update after processing
                 upload_date,
@@ -278,7 +278,7 @@ pub async fn handle_upload(
                 }
 
                 // create thumbnail
-                let thumbnail_path = format!("videos/output/{}/thumbnail.jpg", id);
+                let thumbnail_path = format!("videos/output/{}/thumbnail.jpg", id_clone);
                 let mut thumbnail_generated = false;
 
                 if let Some(dur) = duration {
@@ -313,7 +313,6 @@ pub async fn handle_upload(
                 }
 
                 // save to database
-                let upload_date = Utc::now().to_rfc3339();
                 let thumbnail_filename = if thumbnail_generated {
                     Some(format!("{}/thumbnail.jpg", id_clone))
                 } else {
